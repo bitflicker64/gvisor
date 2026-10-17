@@ -108,6 +108,15 @@ func (d *DAD) Restore(protocolMU sync.Locker, secureRNG io.Reader) {
 	d.addresses = make(map[tcpip.Address]dadState)
 }
 
+// Rebind updates the clock, RNG, and NIC ID on a disabled DAD instance.
+//
+// Precondition: protocolMU must be locked and no DAD timers may be active.
+func (d *DAD) Rebind(clock tcpip.Clock, secureRNG io.Reader, nicID tcpip.NICID) {
+	d.opts.Clock = clock
+	d.opts.SecureRNG = secureRNG
+	d.opts.NICID = nicID
+}
+
 // CheckDuplicateAddressLocked performs DAD for an address, calling the
 // completion handler once DAD resolves.
 //

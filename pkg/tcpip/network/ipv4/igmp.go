@@ -301,6 +301,14 @@ func (igmp *igmpState) init(ep *endpoint) {
 }
 
 // +checklocks:igmp.ep.mu
+func (igmp *igmpState) rebindProtocol() {
+	igmp.genericMulticastProtocol.Rebind(&igmp.ep.mu, igmp.ep.protocol.stack.Clock(), igmp.ep.protocol.stack.InsecureRNG())
+	igmp.igmpV1Job = tcpip.NewJob(igmp.ep.protocol.stack.Clock(), &igmp.ep.mu, func() {
+		igmp.mode = protocolModeV2OrV3
+	})
+}
+
+// +checklocks:igmp.ep.mu
 func (igmp *igmpState) restore() {
 	igmp.genericMulticastProtocol.Restore(&igmp.ep.mu, igmp.ep.protocol.stack.InsecureRNG())
 	igmp.igmpV1Job = tcpip.NewJob(igmp.ep.protocol.stack.Clock(), &igmp.ep.mu, func() {

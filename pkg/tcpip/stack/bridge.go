@@ -15,6 +15,9 @@
 package stack
 
 import (
+	"context"
+	"maps"
+
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -32,6 +35,8 @@ type bridgePort struct {
 type BridgeFDBKey tcpip.LinkAddress
 
 // BridgeFDBEntry consists of all metadata for a FDB record.
+//
+// +stateify savable
 type BridgeFDBEntry struct {
 	port *bridgePort
 }
@@ -124,13 +129,15 @@ func NewBridgeEndpoint(mtu uint32) *BridgeEndpoint {
 	return b
 }
 
+type bridgePorts = map[tcpip.NICID]*bridgePort
+
 // BridgeEndpoint is a bridge endpoint.
 //
 // +stateify savable
 type BridgeEndpoint struct {
 	mu bridgeRWMutex `state:"nosave"`
 	// +checklocks:mu
-	ports map[tcpip.NICID]*bridgePort
+	ports map[tcpip.NICID]*bridgePort `state:".(bridgePorts)"`
 	// +checklocks:mu
 	dispatcher NetworkDispatcher
 	// +checklocks:mu
@@ -140,7 +147,7 @@ type BridgeEndpoint struct {
 	// +checklocks:mu
 	mtu uint32
 	// +checklocks:mu
-	fdbTable        map[BridgeFDBKey]BridgeFDBEntry
+	fdbTable        map[BridgeFDBKey]BridgeFDBEntry `state:".(map[BridgeFDBKey]BridgeFDBEntry)"`
 	maxHeaderLength atomicbitops.Uint32
 }
 
@@ -180,7 +187,7 @@ func (b *BridgeEndpoint) AddNIC(n *nic) tcpip.Error {
 		bridge: b,
 	}
 	n.NetworkLinkEndpoint.Attach(port)
-	b.ports[n.id] = port
+	b.ports[n.ID()] = port
 
 	if b.maxHeaderLength.Load() < uint32(n.MaxHeaderLength()) {
 		b.maxHeaderLength.Store(uint32(n.MaxHeaderLength()))
@@ -194,13 +201,13 @@ func (b *BridgeEndpoint) DelNIC(nic *nic) tcpip.Error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	port := b.ports[nic.id]
+	port := b.ports[nic.ID()]
 	for k, e := range b.fdbTable {
 		if e.port == port {
 			delete(b.fdbTable, k)
 		}
 	}
-	delete(b.ports, nic.id)
+	delete(b.ports, nic.ID())
 	nic.NetworkLinkEndpoint.Attach(nic)
 	return nil
 }
@@ -309,4 +316,44 @@ func (b *BridgeEndpoint) FindFDBEntry(addr tcpip.LinkAddress) BridgeFDBEntry {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return b.fdbTable[BridgeFDBKey(addr)]
+}
+
+// +checklocksexclude:b.mu
+func (b *BridgeEndpoint) savePorts() bridgePorts {
+	b.mu.RLock()
+	ports := maps.Clone(b.ports)
+	b.mu.RUnlock()
+	for id, port := range ports {
+		if !port.nic.isPreserved() {
+			delete(ports, id)
+		}
+	}
+	return ports
+}
+
+// +checklocksexclude:b.mu
+func (b *BridgeEndpoint) loadPorts(_ context.Context, ports bridgePorts) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.ports = ports
+}
+
+// +checklocksexclude:b.mu
+func (b *BridgeEndpoint) saveFdbTable() map[BridgeFDBKey]BridgeFDBEntry {
+	b.mu.RLock()
+	fdb := maps.Clone(b.fdbTable)
+	b.mu.RUnlock()
+	for k, entry := range fdb {
+		if entry.port == nil || !entry.port.nic.isPreserved() {
+			delete(fdb, k)
+		}
+	}
+	return fdb
+}
+
+// +checklocksexclude:b.mu
+func (b *BridgeEndpoint) loadFdbTable(_ context.Context, fdb map[BridgeFDBKey]BridgeFDBEntry) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.fdbTable = fdb
 }

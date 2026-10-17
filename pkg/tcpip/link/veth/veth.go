@@ -16,6 +16,9 @@
 package veth
 
 import (
+	"context"
+
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -25,6 +28,7 @@ import (
 const DefaultBacklogSize = 1000
 
 var _ stack.LinkEndpoint = (*Endpoint)(nil)
+var _ stack.PausableLinkEndpoint = (*Endpoint)(nil)
 var _ stack.GSOEndpoint = (*Endpoint)(nil)
 
 // +stateify savable
@@ -34,7 +38,26 @@ type veth struct {
 	// +checklocks:mu
 	closed bool
 
+	// paused indicates that no worker goroutine is running (stopCh is closed
+	// or nil).
+	//
+	// +checklocks:mu
+	paused bool `state:"nosave"`
+
+	// backlogQueueSize is the capacity of backlogQueue.
+	backlogQueueSize uint32
+
+	// savedBacklog holds queued packets in oldest-first order and owns their
+	// PacketBuffer references while the pair is paused or saved.
+	//
+	// +checklocks:mu
+	savedBacklog []vethPacket
+
 	backlogQueue chan vethPacket `state:"nosave"`
+	// stopCh signals the active worker to exit. Closed at most once per worker
+	// instance and recreated in resume.
+	stopCh chan struct{}  `state:"nosave"`
+	wg     sync.WaitGroup `state:"nosave"`
 
 	// +checklocks:mu
 	mtu uint32
@@ -42,16 +65,124 @@ type veth struct {
 	endpoints [2]Endpoint
 }
 
-// close shuts down both endpoints, invoking close callbacks after unlocking.
+func (v *veth) worker(ch <-chan vethPacket, stopCh <-chan struct{}) {
+	defer v.wg.Done()
+	for {
+		// Check stopCh first so stopping takes precedence over a ready packet
+		// in ch.
+		select {
+		case <-stopCh:
+			return
+		default:
+		}
+		select {
+		case <-stopCh:
+			return
+		case t := <-ch:
+			t.e.InjectInbound(t.protocol, t.pkt)
+			t.pkt.DecRef()
+		}
+	}
+}
+
+// +checklocks:v.mu
+func (v *veth) drainBacklogLocked() {
+	for {
+		select {
+		case pkt := <-v.backlogQueue:
+			v.savedBacklog = append(v.savedBacklog, pkt)
+		default:
+			return
+		}
+	}
+}
+
+// +checklocks:v.mu
+func (v *veth) clearSavedBacklogLocked() {
+	for _, pkt := range v.savedBacklog {
+		pkt.pkt.DecRef()
+	}
+	v.savedBacklog = nil
+}
+
+// +checklocks:v.mu
+func (v *veth) restoreBacklogLocked() {
+	v.drainBacklogLocked()
+	for _, pkt := range v.savedBacklog {
+		select {
+		case v.backlogQueue <- pkt:
+		default:
+			pkt.pkt.DecRef()
+		}
+	}
+	v.savedBacklog = nil
+}
+
+// pause stops the worker goroutine, waits for any in-flight InjectInbound call
+// to finish, and drains backlogQueue into savedBacklog.
 //
-// The caller must not hold either endpoint's mutex. checklocks cannot name
-// those mutexes through the endpoints array.
+// Callers must not hold any lock that the inbound delivery path can acquire
+// (such as Stack.mu or BridgeEndpoint.mu), and pause must not run concurrently
+// with resume (otherwise resume could start a new worker with an open stopCh
+// before v.wg.Wait returns, causing pause to block indefinitely).
+//
+// +checklocksexclude:v.mu
+func (v *veth) pause() {
+	v.mu.Lock()
+	if v.closed {
+		v.mu.Unlock()
+		return
+	}
+	if !v.paused {
+		v.paused = true
+		close(v.stopCh)
+	}
+	v.mu.Unlock()
+
+	v.wg.Wait()
+
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if !v.closed {
+		v.drainBacklogLocked()
+	}
+}
+
+// resume restores savedBacklog into backlogQueue and starts a new worker
+// goroutine.
+//
+// resume must not run concurrently with pause; see pause.
+//
+// +checklocksexclude:v.mu
+func (v *veth) resume() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.closed || !v.paused {
+		return
+	}
+	v.paused = false
+	v.stopCh = make(chan struct{})
+	v.restoreBacklogLocked()
+	v.wg.Add(1)
+	go v.worker(v.backlogQueue, v.stopCh)
+}
+
+// close shuts down both endpoints, invoking close callbacks after unlocking
+// and waiting for the worker goroutine to exit.
+//
+// Because close blocks on v.wg.Wait until the worker finishes InjectInbound,
+// the caller must not hold any lock that the inbound delivery path can acquire
+// (such as Stack.mu or BridgeEndpoint.mu), nor either endpoint's mutex.
+// checklocks cannot name the endpoint mutexes through the endpoints array.
 //
 // +checklocksexclude:v.mu
 func (v *veth) close() {
 	v.mu.Lock()
 	closed := v.closed
 	v.closed = true
+	if !closed && !v.paused {
+		close(v.stopCh)
+	}
 	v.mu.Unlock()
 	if closed {
 		return
@@ -67,7 +198,23 @@ func (v *veth) close() {
 			action()
 		}
 	}
-	close(v.backlogQueue)
+
+	v.wg.Wait()
+
+	v.mu.Lock()
+	v.drainBacklogLocked()
+	v.clearSavedBacklogLocked()
+	v.mu.Unlock()
+}
+
+// afterLoad is invoked by stateify.
+//
+// +checklocksexclude:v.mu
+func (v *veth) afterLoad(context.Context) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.backlogQueue = make(chan vethPacket, v.backlogQueueSize)
+	v.paused = true
 }
 
 // +stateify savable
@@ -98,9 +245,11 @@ type Endpoint struct {
 
 // NewPair creates a new veth pair.
 func NewPair(mtu, backlogQueueSize uint32) (*Endpoint, *Endpoint) {
-	veth := veth{
-		backlogQueue: make(chan vethPacket, backlogQueueSize),
-		mtu:          mtu,
+	v := &veth{
+		backlogQueueSize: backlogQueueSize,
+		backlogQueue:     make(chan vethPacket, backlogQueueSize),
+		stopCh:           make(chan struct{}),
+		mtu:              mtu,
 		endpoints: [2]Endpoint{
 			{
 				linkAddr: tcpip.GetRandMacAddr(),
@@ -110,24 +259,22 @@ func NewPair(mtu, backlogQueueSize uint32) (*Endpoint, *Endpoint) {
 			},
 		},
 	}
-	a := &veth.endpoints[0]
-	b := &veth.endpoints[1]
+	a := &v.endpoints[0]
+	b := &v.endpoints[1]
 	a.peer = b
 	b.peer = a
-	a.veth = &veth
-	b.veth = &veth
-	go func() {
-		for t := range veth.backlogQueue {
-			t.e.InjectInbound(t.protocol, t.pkt)
-			t.pkt.DecRef()
-		}
-
-	}()
+	a.veth = v
+	b.veth = v
+	v.wg.Add(1)
+	go v.worker(v.backlogQueue, v.stopCh)
 	return a, b
 }
 
-// Close closes e. Further packet injections will return an error, and all pending
-// packets are discarded. Close may be called concurrently with WritePackets.
+// Close closes e. Further packet injections will return an error, and all
+// pending packets are discarded. Close may be called concurrently with
+// WritePackets, and blocks until the background worker finishes any in-flight
+// InjectInbound delivery, so callers must not hold locks that inbound delivery
+// can acquire (such as Stack.mu or BridgeEndpoint.mu).
 //
 // +checklocksexclude:e.veth.mu
 // +checklocksexclude:e.mu
@@ -266,8 +413,21 @@ func (e *Endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) 
 	return n, nil
 }
 
-// Wait implements stack.LinkEndpoint.Wait.
-func (*Endpoint) Wait() {}
+// Wait implements stack.LinkEndpoint.Wait. It blocks until close or pause
+// exits the worker.
+func (e *Endpoint) Wait() {
+	e.veth.wg.Wait()
+}
+
+// Pause implements stack.PausableLinkEndpoint.Pause.
+func (e *Endpoint) Pause() {
+	e.veth.pause()
+}
+
+// Resume implements stack.PausableLinkEndpoint.Resume.
+func (e *Endpoint) Resume() {
+	e.veth.resume()
+}
 
 // ARPHardwareType implements stack.LinkEndpoint.ARPHardwareType.
 func (*Endpoint) ARPHardwareType() header.ARPHardwareType {

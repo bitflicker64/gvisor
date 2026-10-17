@@ -545,6 +545,14 @@ func (g *GenericMulticastProtocolState) newDelayedReportJob(groupAddress tcpip.A
 	})
 }
 
+// Rebind updates the clock and RNG on a disabled multicast protocol instance.
+//
+// Precondition: protocolMU must be locked.
+func (g *GenericMulticastProtocolState) Rebind(protocolMU *sync.RWMutex, clock tcpip.Clock, rand *rand.Rand) {
+	g.opts.Clock = clock
+	g.Restore(protocolMU, rand)
+}
+
 // Restore re-initializes state:"nosave" fields after restore.
 //
 // Precondition: protocolMU must be locked.

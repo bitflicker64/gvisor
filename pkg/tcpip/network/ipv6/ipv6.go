@@ -251,6 +251,7 @@ type endpoint struct {
 // Restore implements stack.RestorableNetworkEndpoint.
 func (e *endpoint) Restore() {
 	e.mu.Lock()
+	e.mu.addressableEndpointState.Restore(e.mu.ndp.savedAddressRefs())
 	e.dad.mu.Lock()
 	e.dad.mu.dad.Restore(&e.dad.mu, e.protocol.stack.SecureRNG().Reader)
 	e.dad.mu.Unlock()
@@ -270,6 +271,36 @@ func (e *endpoint) Restore() {
 	e.protocol.mu.Lock()
 	e.protocol.mu.eps[e.nic.ID()] = e
 	e.protocol.mu.Unlock()
+}
+
+// RebindProtocol implements stack.RestorableNetworkEndpoint.
+func (e *endpoint) RebindProtocol(proto stack.NetworkProtocol) {
+	p := proto.(*protocol)
+	if oldProto := e.protocol; oldProto != nil {
+		oldProto.mu.Lock()
+		for id, ep := range oldProto.mu.eps {
+			if ep == e {
+				delete(oldProto.mu.eps, id)
+			}
+		}
+		oldProto.mu.Unlock()
+	}
+
+	e.mu.Lock()
+	e.protocol = p
+	stackStats := p.stack.Stats()
+	e.stats.ip.Init(&e.stats.localStats.IP, &stackStats.IP)
+	e.stats.icmp.init(&e.stats.localStats.ICMP, &stackStats.ICMP.V6)
+	e.dad.mu.Lock()
+	e.dad.mu.dad.Rebind(p.stack.Clock(), p.stack.SecureRNG().Reader, e.nic.ID())
+	e.dad.mu.Unlock()
+	e.mu.mld.rebindProtocol()
+	e.mu.ndp.dad.Rebind(p.stack.Clock(), p.stack.SecureRNG().Reader, e.nic.ID())
+	e.mu.Unlock()
+
+	p.mu.Lock()
+	p.mu.eps[e.nic.ID()] = e
+	p.mu.Unlock()
 }
 
 // NICNameFromID is a function that returns a stable name for the specified NIC,

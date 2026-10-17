@@ -70,6 +70,17 @@ func (e *endpoint) Restore() {
 	e.dad.Restore(&e.mu, e.protocol.stack.SecureRNG().Reader)
 }
 
+// RebindProtocol implements stack.RestorableNetworkEndpoint.
+func (e *endpoint) RebindProtocol(proto stack.NetworkProtocol) {
+	p := proto.(*protocol)
+	e.mu.Lock()
+	e.protocol = p
+	e.dad.Rebind(p.stack.Clock(), p.stack.SecureRNG().Reader, e.nic.ID())
+	stackStats := p.stack.Stats()
+	e.stats.arp.init(&e.stats.localStats.ARP, &stackStats.ARP)
+	e.mu.Unlock()
+}
+
 // CheckDuplicateAddress implements stack.DuplicateAddressDetector.
 func (e *endpoint) CheckDuplicateAddress(addr tcpip.Address, h stack.DADCompletionHandler) stack.DADCheckAddressDisposition {
 	e.mu.Lock()

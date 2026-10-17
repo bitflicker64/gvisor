@@ -114,12 +114,40 @@ type endpoint struct {
 // Restore implements stack.RestorableNetworkEndpoint.
 func (e *endpoint) Restore() {
 	e.mu.Lock()
+	e.addressableEndpointState.Restore(nil)
 	e.igmp.restore()
 	e.mu.Unlock()
 
 	e.protocol.mu.Lock()
 	e.protocol.eps[e.nic.ID()] = e
 	e.protocol.mu.Unlock()
+}
+
+// RebindProtocol implements stack.RestorableNetworkEndpoint.
+func (e *endpoint) RebindProtocol(proto stack.NetworkProtocol) {
+	p := proto.(*protocol)
+	if oldProto := e.protocol; oldProto != nil {
+		oldProto.mu.Lock()
+		for id, ep := range oldProto.eps {
+			if ep == e {
+				delete(oldProto.eps, id)
+			}
+		}
+		oldProto.mu.Unlock()
+	}
+
+	e.mu.Lock()
+	e.protocol = p
+	stackStats := p.stack.Stats()
+	e.stats.ip.Init(&e.stats.localStats.IP, &stackStats.IP)
+	e.stats.icmp.init(&e.stats.localStats.ICMP, &stackStats.ICMP.V4)
+	e.stats.igmp.init(&e.stats.localStats.IGMP, &stackStats.IGMP)
+	e.igmp.rebindProtocol()
+	e.mu.Unlock()
+
+	p.mu.Lock()
+	p.eps[e.nic.ID()] = e
+	p.mu.Unlock()
 }
 
 // SetIGMPVersion implements IGMPEndpoint.

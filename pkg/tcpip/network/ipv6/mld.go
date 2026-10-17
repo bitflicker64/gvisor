@@ -244,6 +244,11 @@ func (mld *mldState) init(ep *endpoint) {
 }
 
 // +checklocks:mld.ep.mu.RWMutex
+func (mld *mldState) rebindProtocol() {
+	mld.genericMulticastProtocol.Rebind(&mld.ep.mu.RWMutex, mld.ep.protocol.stack.Clock(), mld.ep.protocol.stack.InsecureRNG())
+}
+
+// +checklocks:mld.ep.mu.RWMutex
 func (mld *mldState) restore() {
 	mld.genericMulticastProtocol.Restore(&mld.ep.mu.RWMutex, mld.ep.protocol.stack.InsecureRNG())
 }

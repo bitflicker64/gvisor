@@ -948,12 +948,16 @@ type NetworkEndpoint interface {
 }
 
 // RestorableNetworkEndpoint is a network endpoint that needs to restore state
-// after being loaded from a checkpoint.
+// after being loaded from a checkpoint or moved between stacks.
 type RestorableNetworkEndpoint interface {
 	NetworkEndpoint
 
 	// Restore restores the network endpoint after a checkpoint load.
 	Restore()
+
+	// RebindProtocol rebinds a disabled network endpoint to proto on the
+	// destination stack during ReplaceConfig.
+	RebindProtocol(proto NetworkProtocol)
 }
 
 // NetworkEndpointStats is the interface implemented by each network endpoint
@@ -1315,6 +1319,24 @@ type InjectableLinkEndpoint interface {
 	//
 	// dest is used by endpoints with multiple raw destinations.
 	InjectOutbound(dest tcpip.Address, packet *buffer.View) tcpip.Error
+}
+
+// PausableLinkEndpoint is a LinkEndpoint with background workers that can be
+// paused before save and resumed after save or restore.
+//
+// Implementations must ensure that:
+//   - Pause blocks until all background packet-processing workers have exited.
+//   - Pause and Resume are both idempotent, since Stack calls them per NIC
+//     (including on shared pair endpoints and wrapper endpoints).
+type PausableLinkEndpoint interface {
+	LinkEndpoint
+
+	// Pause pauses background packet processing on the endpoint and waits for
+	// workers to exit.
+	Pause()
+
+	// Resume resumes background packet processing on the endpoint.
+	Resume()
 }
 
 // DADResult is a marker interface for the result of a duplicate address

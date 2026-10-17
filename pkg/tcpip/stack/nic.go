@@ -43,7 +43,7 @@ type nic struct {
 	NetworkLinkEndpoint
 
 	stack   *Stack
-	id      tcpip.NICID
+	id      atomicbitops.Int32
 	name    string
 	kind    string
 	context NICContext
@@ -206,7 +206,7 @@ func newNIC(stack *Stack, id tcpip.NICID, ep LinkEndpoint, opts NICOptions) *nic
 	nic := &nic{
 		NetworkLinkEndpoint:       ep,
 		stack:                     stack,
-		id:                        id,
+		id:                        atomicbitops.FromInt32(int32(id)),
 		name:                      opts.Name,
 		context:                   opts.Context,
 		stats:                     makeNICStats(stack.Stats().NICs),
@@ -938,7 +938,7 @@ func (n *nic) DeliverLinkPacket(protocol tcpip.NetworkProtocolNumber, pkt *Packe
 
 		clone := packetEPPkt.Clone()
 		defer clone.DecRef()
-		ep.HandlePacket(n.id, protocol, clone)
+		ep.HandlePacket(n.ID(), protocol, clone)
 	}
 
 	n.packetEPsMu.Lock()
@@ -1070,7 +1070,11 @@ func (n *nic) DeliverRawPacket(protocol tcpip.TransportProtocolNumber, pkt *Pack
 
 // ID implements NetworkInterface.
 func (n *nic) ID() tcpip.NICID {
-	return n.id
+	return tcpip.NICID(n.id.Load())
+}
+
+func (n *nic) setID(id tcpip.NICID) {
+	n.id.Store(int32(id))
 }
 
 // Name implements NetworkInterface.

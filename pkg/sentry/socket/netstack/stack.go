@@ -29,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/socket/netfilter"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netlink/nlmsg"
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -38,6 +39,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/link/veth"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
+	"gvisor.dev/gvisor/pkg/tcpip/nftables"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 )
@@ -729,12 +731,12 @@ func (s *Stack) newVeth(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesVie
 	id := s.Stack.NextNICID()
 	peerID := peerStack.Stack.NextNICID()
 	if ifname == "" {
-		ifname = s.allocDeviceName("veth", dstNs)
+		ifname = s.allocDeviceName(stack.NICKindVeth, dstNs)
 	}
 	// Linux's veth_setup uses ether_setup, which sets IFF_MULTICAST.
 	err := s.Stack.CreateNICWithOptions(id, packetsocket.New(ethernet.NewWithNetworkMTU(ep)), stack.NICOptions{
 		Name:      ifname,
-		Kind:      "veth",
+		Kind:      stack.NICKindVeth,
 		Multicast: true,
 	})
 	if err != nil {
@@ -757,12 +759,12 @@ func (s *Stack) newVeth(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesVie
 	defer peerStack.unlockSrcAndDst(ctx, peerDstNs)
 
 	if peerName == "" {
-		peerName = peerStack.allocDeviceName("veth", peerDstNs)
+		peerName = peerStack.allocDeviceName(stack.NICKindVeth, peerDstNs)
 	}
 
 	err = peerStack.Stack.CreateNICWithOptions(peerID, packetsocket.New(ethernet.NewWithNetworkMTU(peerEP)), stack.NICOptions{
 		Name:      peerName,
-		Kind:      "veth",
+		Kind:      stack.NICKindVeth,
 		Multicast: true,
 	})
 	if err != nil {
@@ -793,14 +795,14 @@ func (s *Stack) newBridge(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesV
 		ifname = v.String()
 	}
 	if ifname == "" {
-		ifname = s.allocDeviceName("bridge", dstNs)
+		ifname = s.allocDeviceName(stack.NICKindBridge, dstNs)
 	}
 	ep := stack.NewBridgeEndpoint(defaultMTU)
 	id := s.Stack.NextNICID()
 	// Linux's br_dev_setup also inherits IFF_MULTICAST from ether_setup.
 	err := s.Stack.CreateNICWithOptions(id, ep, stack.NICOptions{
 		Name:      ifname,
-		Kind:      "bridge",
+		Kind:      stack.NICKindBridge,
 		Multicast: true,
 	})
 	if err != nil {
@@ -842,9 +844,9 @@ func (s *Stack) newInterface(ctx context.Context, msg *nlmsg.Message, linkAttrs 
 	switch kind {
 	case "":
 		return syserr.ErrInvalidArgument
-	case "bridge":
+	case stack.NICKindBridge:
 		return s.newBridge(ctx, linkAttrs, linkInfoAttrs)
-	case "veth":
+	case stack.NICKindVeth:
 		return s.newVeth(ctx, linkAttrs, linkInfoAttrs)
 	}
 	return syserr.ErrNotSupported
@@ -1594,9 +1596,42 @@ func (s *Stack) Pause() {
 	s.Stack.Pause()
 }
 
-// Restore implements inet.Stack.Restore.
-func (s *Stack) Restore() {
-	s.Stack.Restore()
+// InitDefaultTables initializes default Linux iptables and nftables on s.Stack
+// if they have not already been initialized.
+func (s *Stack) InitDefaultTables() {
+	if s.Stack.IPTables() == nil {
+		s.Stack.SetIPTables(netfilter.DefaultLinuxTables(s.Stack.Clock(), s.Stack.InsecureRNG()))
+	}
+	if s.Stack.NFTables() == nil && nftables.IsNFTablesEnabled() {
+		s.Stack.SetNFTables(nftables.NewNFTables(s.Stack, s.Stack.Clock(), s.Stack.SecureRNG()))
+	}
+}
+
+// RestoreNICsAndEndpoints implements inet.Stack.RestoreNICsAndEndpoints. It
+// restores preserved NICs, routes, and transport endpoints on the stack without
+// waiting for asynchronous endpoint loading or starting protocol and link-layer
+// background workers.
+func (s *Stack) RestoreNICsAndEndpoints() {
+	// stack.Stack.tables and stack.Stack.nftables are state:"nosave". On
+	// restore, ConfigureNetwork/ReplaceConfig is only invoked on the root
+	// stack (when host networking is reconfigured), so initialize default
+	// Linux-wrapped netfilter/nftables tables here before
+	// s.Stack.RestoreNICsAndEndpoints() would fall back to raw
+	// stack.DefaultTables().
+	s.InitDefaultTables()
+	s.Stack.RestoreNICsAndEndpoints()
+}
+
+// StartBackgroundWorkers implements inet.Stack.StartBackgroundWorkers. It
+// starts protocol and link-layer background workers after asynchronous endpoint
+// loading has completed.
+func (s *Stack) StartBackgroundWorkers() {
+	s.Stack.StartBackgroundWorkers()
+}
+
+// PreserveLoopback implements inet.Stack.PreserveLoopback.
+func (s *Stack) PreserveLoopback() {
+	s.Stack.PreserveLoopback()
 }
 
 // ResetConfig implements inet.Stack.ResetConfig.
