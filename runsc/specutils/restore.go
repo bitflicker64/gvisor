@@ -176,6 +176,16 @@ func shouldValidateAnnotation(key string) bool {
 	if strings.HasPrefix(key, annotationMountPrefix) && strings.HasSuffix(key, ".source") {
 		return false
 	}
+	// Journaling rootfs upper annotations select the host files for a
+	// journaled overlay upper layer. Restoring cannot reuse an existing
+	// journal, so these annotations may change to a new prefix, be added,
+	// or be removed during restore.
+	if key == AnnotationRootfsUpperJournal ||
+		strings.HasPrefix(key, AnnotationRootfsUpperJournal+".") ||
+		key == AnnotationRootfsUpperJournalImageID ||
+		strings.HasPrefix(key, AnnotationRootfsUpperJournalImageID+".") {
+		return false
+	}
 	// Flag annotations controlling debug logging can change. They don't impact
 	// the restorability of the snapshot.
 	if strings.HasPrefix(key, annotationFlagPrefix) {

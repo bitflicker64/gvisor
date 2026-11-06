@@ -109,6 +109,37 @@ type Config struct {
 	// archives of overlay upper layers and filesystem checkpoints.
 	TarTimestampResolution TarTimestampResolution `flag:"tar-timestamp-resolution"`
 
+	// JournalingRootfsUpper, if not empty, is the path prefix of the files that
+	// store the root container's rootfs overlay upper layer:
+	// JournalingRootfsUpper + ".filestore" and JournalingRootfsUpper +
+	// ".journal". The upper layer then survives sandbox crashes and restarts.
+	// runsc never deletes these files. Each container, including the root
+	// container, can instead select its own prefix with the
+	// specutils.AnnotationRootfsUpperJournal annotation; for the root
+	// container, the flag and the annotation must then be equal. It requires a
+	// rootfs overlay, whose medium is ignored: the upper's data always lives in
+	// the filestore. Only starting a new container accepts an existing journal
+	// file (replaying it). A restore, a filesystem restore or a rootfs upper
+	// tar can start a new journal when JournalingRootfsUpper + ".journal" does
+	// not exist yet, and fails with an error if it already exists. In a sandbox
+	// created with --fs-restore-image-path, every journaled container counts as
+	// restored, so none of them may have an existing journal; if the filesystem
+	// checkpoint has no entry for that container's rootfs upper, the container
+	// starts a new journal from an empty upper. runsc writes the new journal to
+	// a temporary file JournalingRootfsUpper + ".journal.tmp.*" first; the
+	// owner of the files may delete stray temporary files that a crash left.
+	// Images saved from a sandbox with a journaling rootfs upper restore with
+	// it onto a new prefix, or without it with a root overlay medium of "dir=",
+	// since their rootfs upper is file-backed. Experimental.
+	JournalingRootfsUpper string `flag:"journaling-rootfs-upper"`
+
+	// JournalingRootfsUpperImageID identifies the lower layer of the root
+	// container's rootfs overlay. It is recorded when the journaling upper
+	// layer is created. A container with a different image ID refuses to use
+	// the upper layer. The specutils.AnnotationRootfsUpperJournalImageID
+	// annotation sets it for each container.
+	JournalingRootfsUpperImageID string `flag:"journaling-rootfs-upper-image-id"`
+
 	// FSGoferHostUDS is deprecated: use host-uds=all.
 	FSGoferHostUDS bool `flag:"fsgofer-host-uds"`
 
@@ -441,6 +472,17 @@ type Config struct {
 	// called. This is useful for tests exercising gVisor panic-reporting.
 	TestOnlyAFSSyscallPanic bool `flag:"TESTONLY-afs-syscall-panic"`
 
+	// TestOnlyJournalingRootfsUpperFault should only be used in tests. It
+	// injects a fault in the journaling rootfs upper. The only value is
+	// "activation", which makes the activation of the journal fail after an
+	// image populates the upper.
+	TestOnlyJournalingRootfsUpperFault string `flag:"TESTONLY-journaling-rootfs-upper-fault"`
+
+	// TestOnlyJournalingRootfsUpperRegionSize should only be used in tests.
+	// If not 0, it is the minimum size of the regions of a new journaling
+	// rootfs upper journal.
+	TestOnlyJournalingRootfsUpperRegionSize uint64 `flag:"TESTONLY-journaling-rootfs-upper-region-size"`
+
 	// explicitlySet contains whether a flag was explicitly set on the command-line from which this
 	// Config was constructed. Nil when the Config was not initialized from a FlagSet.
 	explicitlySet map[string]struct{}
@@ -599,6 +641,13 @@ func (c *Config) Validate() error {
 	}
 	if overlay2 := c.GetOverlay2(); c.FileAccess == FileAccessShared && overlay2.Enabled() {
 		return fmt.Errorf("overlay flag is incompatible with shared file access for rootfs")
+	}
+	if c.JournalingRootfsUpper != "" {
+		if !filepath.IsAbs(c.JournalingRootfsUpper) {
+			return fmt.Errorf("journaling-rootfs-upper must be an absolute path, got %q", c.JournalingRootfsUpper)
+		}
+	} else if c.JournalingRootfsUpperImageID != "" {
+		return fmt.Errorf("journaling-rootfs-upper-image-id requires journaling-rootfs-upper")
 	}
 	if c.NumNetworkChannels <= 0 {
 		return fmt.Errorf("num_network_channels must be > 0, got: %d", c.NumNetworkChannels)

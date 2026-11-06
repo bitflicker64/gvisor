@@ -870,6 +870,90 @@ func TestRootfsUpperTarPath(t *testing.T) {
 	}
 }
 
+func TestJournalingRootfsUpper(t *testing.T) {
+	sub := func(annotations map[string]string) specs.Spec {
+		a := map[string]string{
+			ContainerdContainerTypeAnnotation: ContainerdContainerTypeContainer,
+			ContainerdContainerNameAnnotation: "cont",
+		}
+		for k, v := range annotations {
+			a[k] = v
+		}
+		return specs.Spec{Annotations: a}
+	}
+	for _, tc := range []struct {
+		name        string
+		spec        specs.Spec
+		flag        string
+		flagImageID string
+		wantPrefix  string
+		wantImageID string
+		wantErr     string
+	}{
+		{
+			name: "nothing set",
+		},
+		{
+			name:        "flags",
+			flag:        "/upper",
+			flagImageID: "image",
+			wantPrefix:  "/upper",
+			wantImageID: "image",
+		},
+		{
+			name:        "annotations",
+			spec:        specs.Spec{Annotations: map[string]string{AnnotationRootfsUpperJournal: "/upper", AnnotationRootfsUpperJournalImageID: "image"}},
+			wantPrefix:  "/upper",
+			wantImageID: "image",
+		},
+		{
+			name:        "subcontainer annotations",
+			spec:        sub(map[string]string{AnnotationRootfsUpperJournal + ".cont": "/upper", AnnotationRootfsUpperJournalImageID + ".cont": "image"}),
+			wantPrefix:  "/upper",
+			wantImageID: "image",
+		},
+		{
+			// The flag only applies to the root container.
+			name: "unselected subcontainer annotation",
+			spec: sub(map[string]string{AnnotationRootfsUpperJournal + ".other": "/upper"}),
+			flag: "/flag-upper",
+		},
+		{
+			name:    "image ID annotation without prefix",
+			spec:    specs.Spec{Annotations: map[string]string{AnnotationRootfsUpperJournalImageID: "image"}},
+			wantErr: "requires",
+		},
+		{
+			name:    "flag and annotation differ",
+			spec:    specs.Spec{Annotations: map[string]string{AnnotationRootfsUpperJournal: "/upper"}},
+			flag:    "/other",
+			wantErr: "differ",
+		},
+		{
+			name:    "relative annotation prefix",
+			spec:    specs.Spec{Annotations: map[string]string{AnnotationRootfsUpperJournal: "upper"}},
+			wantErr: "absolute path",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conf := &config.Config{
+				JournalingRootfsUpper:        tc.flag,
+				JournalingRootfsUpperImageID: tc.flagImageID,
+			}
+			prefix, imageID, err := JournalingRootfsUpper(&tc.spec, conf)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Errorf("JournalingRootfsUpper: got error %v, want %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil || prefix != tc.wantPrefix || imageID != tc.wantImageID {
+				t.Errorf("JournalingRootfsUpper: got %q, %q, %v; want %q, %q, nil", prefix, imageID, err, tc.wantPrefix, tc.wantImageID)
+			}
+		})
+	}
+}
+
 func TestIsProcFDPath(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -1267,6 +1351,82 @@ func TestValidateSpecForContainerMountAnnotationOptionsSize(t *testing.T) {
 			}),
 			new: newSpec(map[string]string{
 				"dev.gvisor.spec.rootfs.options": "size=2G",
+			}),
+			wantErr: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateSpecForContainer(tc.old, tc.new, "test")
+			if gotErr := err != nil; gotErr != tc.wantErr {
+				t.Errorf("validateSpecForContainer(%v, %v) = %v, wantErr %t", tc.old.Annotations, tc.new.Annotations, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateSpecForContainerJournalingRootfsUpper(t *testing.T) {
+	newSpec := func(annotations map[string]string) *specs.Spec {
+		return &specs.Spec{
+			Process: &specs.Process{
+				Args: []string{"/bin/true"},
+				Cwd:  "/",
+			},
+			Annotations: annotations,
+		}
+	}
+
+	for _, tc := range []struct {
+		name     string
+		old, new *specs.Spec
+		wantErr  bool
+	}{
+		{
+			name: "prefix_changed",
+			old: newSpec(map[string]string{
+				AnnotationRootfsUpperJournal:        "/old/upper",
+				AnnotationRootfsUpperJournalImageID: "image-1",
+			}),
+			new: newSpec(map[string]string{
+				AnnotationRootfsUpperJournal:        "/new/upper",
+				AnnotationRootfsUpperJournalImageID: "image-1",
+			}),
+		},
+		{
+			name: "container_specific_prefix_changed",
+			old: newSpec(map[string]string{
+				AnnotationRootfsUpperJournal + ".root":        "/old/root",
+				AnnotationRootfsUpperJournalImageID + ".root": "image-1",
+			}),
+			new: newSpec(map[string]string{
+				AnnotationRootfsUpperJournal + ".root":        "/new/root",
+				AnnotationRootfsUpperJournalImageID + ".root": "image-1",
+			}),
+		},
+		{
+			name: "journaling_removed",
+			old: newSpec(map[string]string{
+				AnnotationRootfsUpperJournal + ".root":        "/old/root",
+				AnnotationRootfsUpperJournalImageID + ".root": "image-1",
+			}),
+			new: newSpec(nil),
+		},
+		{
+			name: "journaling_added",
+			old:  newSpec(nil),
+			new: newSpec(map[string]string{
+				AnnotationRootfsUpperJournal + ".root":        "/new/root",
+				AnnotationRootfsUpperJournalImageID + ".root": "image-1",
+			}),
+		},
+		{
+			name: "other_gvisor_annotation_still_validated",
+			old: newSpec(map[string]string{
+				AnnotationRootfsUpperJournal:  "/old/upper",
+				"dev.gvisor.spec.rootfs.type": "overlay",
+			}),
+			new: newSpec(map[string]string{
+				AnnotationRootfsUpperJournal:  "/new/upper",
+				"dev.gvisor.spec.rootfs.type": "tmpfs",
 			}),
 			wantErr: true,
 		},
