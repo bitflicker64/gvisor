@@ -60,8 +60,16 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 	},
 	unix.SYS_EXIT:       seccomp.MatchAll{},
 	unix.SYS_EXIT_GROUP: seccomp.MatchAll{},
-	unix.SYS_FALLOCATE:  seccomp.MatchAll{},
-	unix.SYS_FCHMOD:     seccomp.MatchAll{},
+	unix.SYS_FALLOCATE: seccomp.Or{
+		seccomp.PerArg{
+			seccomp.AnyValue{}, /* fd */
+			seccomp.EqualTo(0), /* mode */
+		},
+		seccomp.PerArg{
+			seccomp.AnyValue{}, /* fd */
+			seccomp.EqualTo(unix.FALLOC_FL_PUNCH_HOLE | unix.FALLOC_FL_KEEP_SIZE), /* mode */
+		},
+	},
 	unix.SYS_FCNTL: seccomp.Or{
 		seccomp.PerArg{
 			seccomp.AnyValue{},
@@ -400,6 +408,10 @@ func hostFilesystemFilters(vars precompiledseccomp.Values) seccomp.SyscallRules 
 			seccomp.AnyValue{},
 			seccomp.AnyValue{},
 			seccomp.EqualTo(unix.AT_EMPTY_PATH | unix.AT_SYMLINK_NOFOLLOW),
+		},
+		unix.SYS_FCHMOD: seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.AnyValue{},
 		},
 		unix.SYS_FCHMODAT: seccomp.PerArg{
 			seccomp.NonNegativeFD{},
