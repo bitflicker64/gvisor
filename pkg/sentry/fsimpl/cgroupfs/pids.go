@@ -247,6 +247,9 @@ func (c *pidsController) Charge(t *kernel.Task, d *kernfs.Dentry, res kernel.Cgr
 		}
 
 		c.pendingPool[t] += value
+		if c.pendingPool[t] == 0 {
+			delete(c.pendingPool, t)
+		}
 		c.pendingTotal += value
 		return nil
 	}
@@ -316,7 +319,7 @@ func (d *pidsMaxData) WriteBackground(ctx context.Context, src usermem.IOSequenc
 	if err != nil {
 		return 0, err
 	}
-	if strings.TrimSpace(string(buf)) == "max" {
+	if strings.TrimSpace(string(buf[:ncpy])) == "max" {
 		d.c.mu.Lock()
 		defer d.c.mu.Unlock()
 		d.c.max = pidLimitUnlimited

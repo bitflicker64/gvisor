@@ -837,6 +837,16 @@ TEST_F(Cgroup2Test, PidsEnforcement) {
   ExpectDefaultControlFiles(child);
   ASSERT_NO_ERRNO(child.WriteControlFile("pids.max", "1"));
 
+  // Invalid writes to pids.max fail with EINVAL and leave the limit unchanged.
+  EXPECT_THAT(child.WriteControlFile("pids.max", "m a x"),
+              PosixErrorIs(EINVAL));
+  EXPECT_THAT(child.WriteControlFile("pids.max", "-1"), PosixErrorIs(EINVAL));
+  EXPECT_THAT(child.WriteIntegerControlFile("pids.max", (4 * 1024 * 1024) + 1),
+              PosixErrorIs(EINVAL));
+  EXPECT_THAT(child.WriteIntegerControlFile("pids.max", LLONG_MAX - 1),
+              PosixErrorIs(EINVAL));
+  EXPECT_THAT(child.ReadControlFile("pids.max"), IsPosixErrorOkAndHolds("1\n"));
+
   FileDescriptor event_fd =
       ASSERT_NO_ERRNO_AND_VALUE(Open(child.Relpath("pids.events"), O_RDONLY));
   FileDescriptor event_local_fd = ASSERT_NO_ERRNO_AND_VALUE(
